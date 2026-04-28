@@ -1,0 +1,631 @@
+#!/usr/bin/env bash
+# git-safepull - conservative pull plus cheap archival snapshots for volatile repos.
+
+set -euo pipefail
+
+BUNDLE_ALWAYS=false
+DRY_RUN=false
+QUIET=false
+HIERARCHIC=false
+ARCHIVE=false
+ACCEPT_REWRITE=false
+DISCARD_DIRTY=false
+UPDATE_WORKTREE=false
+NO_BUNDLE=false
+BUNDLE_INTERVAL=""
+KEEP_BUNDLES=""
+KEEP_BUNDLES_DAYS=""
+PRUNE_ARCHIVE=true
+
+usage() {
+    cat <<'EOF'
+usage: git safepull [options]
+
+Safe pull mode (default):
+  git safepull
+
+Archive mode:
+  git safepull --archive
+
+Options:
+  --archive             snapshot all remote refs and fetch all remotes; do not update worktree
+  --update-worktree     with --archive, also update current branch when it is safe
+  --accept-rewrite      after archiving a divergence, reset current branch to upstream
+  --discard-dirty       allow worktree-moving operations to discard local changes
+  --hierarchic          snapshot current remote's branches before fetch
+  --bundle              always create a .bundle backup this run
+  --no-bundle           never create .bundle automatically
+  --bundle-on-event     create bundle on rewrite/delete/fetch-failure events (archive default)
+  --bundle-interval N   optional routine bundle interval, e.g. 24h, 3600s, 7d
+  --keep-bundles N      keep only the newest N bundle files
+  --keep-bundles-days N delete bundle files older than N days
+  --no-prune            with --archive, do not prune deleted remote branches
+  --dry-run             fetch/report but do not update the working tree
+  --quiet               minimal output
+  -h, --help            show this help
+
+Note: Git intercepts "git safepull --help" and looks for a manpage.
+Use "git safepull -h" or "git-safepull --help" for this script's help.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --archive)         ARCHIVE=true; shift ;;
+        --update-worktree) UPDATE_WORKTREE=true; shift ;;
+        --accept-rewrite)  ACCEPT_REWRITE=true; shift ;;
+        --discard-dirty)   DISCARD_DIRTY=true; shift ;;
+        --hierarchic)      HIERARCHIC=true; shift ;;
+        --bundle)          BUNDLE_ALWAYS=true; NO_BUNDLE=false; shift ;;
+        --no-bundle)       NO_BUNDLE=true; BUNDLE_ALWAYS=false; shift ;;
+        --bundle-on-event) NO_BUNDLE=false; BUNDLE_ALWAYS=false; shift ;;
+        --bundle-interval)
+            [[ $# -ge 2 ]] || { echo "missing value for --bundle-interval" >&2; exit 1; }
+            BUNDLE_INTERVAL="$2"; shift 2 ;;
+        --keep-bundles)
+            [[ $# -ge 2 ]] || { echo "missing value for --keep-bundles" >&2; exit 1; }
+            KEEP_BUNDLES="$2"; shift 2 ;;
+        --keep-bundles-days)
+            [[ $# -ge 2 ]] || { echo "missing value for --keep-bundles-days" >&2; exit 1; }
+            KEEP_BUNDLES_DAYS="$2"; shift 2 ;;
+        --no-prune)        PRUNE_ARCHIVE=false; shift ;;
+        --dry-run)         DRY_RUN=true; shift ;;
+        --quiet)           QUIET=true; shift ;;
+        -h|--help)         usage; exit 0 ;;
+        *) echo "unknown option: $1" >&2; usage >&2; exit 1 ;;
+    esac
+done
+
+log() {
+    if ! $QUIET; then
+        printf '%s\n' "$*"
+    fi
+}
+
+warn() {
+    printf '*** %s\n' "$*" >&2
+}
+
+die() {
+    warn "$*"
+    exit 1
+}
+
+run_logged() {
+    if $QUIET; then
+        "$@" >/dev/null 2>&1
+    else
+        "$@" 2>&1 | sed 's/^/  /'
+    fi
+}
+
+git rev-parse --git-dir >/dev/null 2>&1 || die "not a git repository"
+
+NOW="$(date +%Y%m%d-%H%M%S)"
+GIT_DIR_ABS="$(git rev-parse --absolute-git-dir)"
+if TOPLEVEL="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+    REPO_NAME="$(basename "$TOPLEVEL")"
+else
+    REPO_NAME="$(basename "$GIT_DIR_ABS" .git)"
+fi
+BACKUP_DIR="$GIT_DIR_ABS/safepull-bundles"
+
+tmp_files=()
+cleanup() {
+    if [[ ${#tmp_files[@]} -gt 0 ]]; then
+        rm -f "${tmp_files[@]}"
+    fi
+}
+trap cleanup EXIT
+
+make_tmp() {
+    local f
+    f="$(mktemp)"
+    tmp_files+=("$f")
+    printf '%s\n' "$f"
+}
+
+current_branch() {
+    git symbolic-ref --short HEAD 2>/dev/null || true
+}
+
+require_head() {
+    git rev-parse --verify HEAD 2>/dev/null
+}
+
+stamp_for_oid() {
+    local oid="$1"
+    local short date
+    short="$(git rev-parse --short=8 "$oid")"
+    if git cat-file -e "$oid^{commit}" 2>/dev/null; then
+        date="$(git log -1 --format='%cd' --date=format:'%Y%m%d-%H%M%S' "$oid^{commit}")"
+    else
+        date="$NOW"
+    fi
+    printf '%s-%s\n' "$date" "$short"
+}
+
+worktree_dirty() {
+    ! git diff --quiet 2>/dev/null ||
+        ! git diff --cached --quiet 2>/dev/null ||
+        [[ -n "$(git ls-files --others --exclude-standard 2>/dev/null)" ]]
+}
+
+require_clean_worktree() {
+    if $DISCARD_DIRTY; then
+        warn "--discard-dirty set: local working tree changes may be lost"
+        return 0
+    fi
+
+    if worktree_dirty; then
+        die "working tree has uncommitted changes; commit/stash them or pass --discard-dirty"
+    fi
+}
+
+snapshot_head() {
+    local branch="$1"
+    local head="$2"
+    local stamp tag_name ref_name existing
+
+    stamp="$(stamp_for_oid "$head")"
+    tag_name="safepull/$stamp"
+    ref_name="refs/safepull/heads/$branch/$stamp"
+
+    if existing="$(git rev-parse --verify --quiet "refs/tags/$tag_name")"; then
+        if [[ "$existing" == "$head" ]]; then
+            log "tag $tag_name already exists (HEAD unchanged)"
+        else
+            warn "tag $tag_name already exists but points at ${existing:0:12}; keeping it"
+        fi
+    elif git tag "$tag_name" "$head" 2>/dev/null; then
+        log "tagged HEAD as $tag_name"
+    else
+        warn "could not create tag $tag_name"
+    fi
+
+    git update-ref "$ref_name" "$head"
+}
+
+capture_refs() {
+    local prefix="$1"
+    local outfile="$2"
+    : >"$outfile"
+
+    git for-each-ref --format='%(refname)%09%(objectname)%09%(symref)' "$prefix" |
+        while IFS=$'\t' read -r ref oid symref; do
+            [[ -n "$symref" ]] && continue
+            printf '%s\t%s\n' "$ref" "$oid" >>"$outfile"
+        done
+}
+
+snapshot_refs_file() {
+    local file="$1"
+    local kind="$2"
+    local ref oid rel stamp dst
+
+    while IFS=$'\t' read -r ref oid; do
+        [[ -z "${ref:-}" ]] && continue
+        case "$kind" in
+            remotes)
+                rel="${ref#refs/remotes/}"
+                dst="refs/safepull/remotes/$rel/$(stamp_for_oid "$oid")"
+                ;;
+            tags)
+                rel="${ref#refs/tags/}"
+                dst="refs/safepull/tags/$rel/$(stamp_for_oid "$oid")"
+                ;;
+            *)
+                die "internal error: unknown snapshot kind $kind"
+                ;;
+        esac
+        git update-ref "$dst" "$oid"
+    done <"$file"
+}
+
+load_ref_map() {
+    local file="$1"
+    local -n map_ref="$2"
+    local ref oid
+
+    map_ref=()
+    while IFS=$'\t' read -r ref oid; do
+        [[ -z "${ref:-}" ]] && continue
+        # shellcheck disable=SC2034 # map_ref is a nameref to the caller's associative array.
+        map_ref["$ref"]="$oid"
+    done <"$file"
+}
+
+detect_remote_events() {
+    local before_file="$1"
+    local after_file="$2"
+    local -n event_ref="$3"
+    local -A before after
+    local ref old_oid new_oid short_ref
+
+    load_ref_map "$before_file" before
+    load_ref_map "$after_file" after
+
+    for ref in "${!before[@]}"; do
+        old_oid="${before[$ref]}"
+        short_ref="${ref#refs/remotes/}"
+
+        if [[ ! ${after[$ref]+_} ]]; then
+            warn "remote ref deleted: $short_ref @ ${old_oid:0:12}"
+            event_ref=true
+            continue
+        fi
+
+        new_oid="${after[$ref]}"
+        [[ "$old_oid" == "$new_oid" ]] && continue
+
+        if git merge-base --is-ancestor "$old_oid" "$new_oid" 2>/dev/null; then
+            log "remote fast-forward: $short_ref ${old_oid:0:12}..${new_oid:0:12}"
+        else
+            warn "remote ref rewritten: $short_ref ${old_oid:0:12} -> ${new_oid:0:12}"
+            # shellcheck disable=SC2034 # event_ref is a nameref to the caller's flag.
+            event_ref=true
+        fi
+    done
+}
+
+detect_tag_events() {
+    local before_file="$1"
+    local after_file="$2"
+    local -n event_ref="$3"
+    local -A before after
+    local ref old_oid new_oid short_ref
+
+    load_ref_map "$before_file" before
+    load_ref_map "$after_file" after
+
+    for ref in "${!before[@]}"; do
+        old_oid="${before[$ref]}"
+        short_ref="${ref#refs/tags/}"
+
+        if [[ ! ${after[$ref]+_} ]]; then
+            warn "local tag deleted: $short_ref @ ${old_oid:0:12}"
+            event_ref=true
+            continue
+        fi
+
+        new_oid="${after[$ref]}"
+        [[ "$old_oid" == "$new_oid" ]] && continue
+
+        warn "local tag moved: $short_ref ${old_oid:0:12} -> ${new_oid:0:12}"
+        # shellcheck disable=SC2034 # event_ref is a nameref to the caller's flag.
+        event_ref=true
+    done
+}
+
+interval_seconds() {
+    local value="$1"
+    local number unit
+
+    if [[ "$value" =~ ^([0-9]+)([smhd]?)$ ]]; then
+        number="${BASH_REMATCH[1]}"
+        unit="${BASH_REMATCH[2]}"
+        case "$unit" in
+            ""|s) printf '%s\n' "$number" ;;
+            m) printf '%s\n' $((number * 60)) ;;
+            h) printf '%s\n' $((number * 3600)) ;;
+            d) printf '%s\n' $((number * 86400)) ;;
+        esac
+    else
+        die "invalid --bundle-interval value: $value"
+    fi
+}
+
+bundle_due_by_interval() {
+    [[ -n "$BUNDLE_INTERVAL" ]] || return 1
+
+    local marker="$BACKUP_DIR/.last-routine-bundle"
+    local interval now last
+    interval="$(interval_seconds "$BUNDLE_INTERVAL")"
+    now="$(date +%s)"
+
+    if [[ ! -f "$marker" ]]; then
+        return 0
+    fi
+
+    last="$(cat "$marker" 2>/dev/null || echo 0)"
+    [[ $((now - last)) -ge "$interval" ]]
+}
+
+mark_routine_bundle() {
+    mkdir -p "$BACKUP_DIR"
+    date +%s >"$BACKUP_DIR/.last-routine-bundle"
+}
+
+create_bundle() {
+    local reason="$1"
+    local bundle size
+
+    if $NO_BUNDLE; then
+        log "bundle skipped (--no-bundle)"
+        return 0
+    fi
+
+    mkdir -p "$BACKUP_DIR"
+    bundle="$BACKUP_DIR/${REPO_NAME}-${reason}-${NOW}.bundle"
+
+    git bundle create "$bundle" --all >/dev/null
+    git bundle verify "$bundle" >/dev/null
+    size="$(du -h "$bundle" | cut -f1)"
+    log "bundle: $bundle ($size)"
+}
+
+rotate_bundles() {
+    [[ -d "$BACKUP_DIR" ]] || return 0
+
+    if [[ -n "$KEEP_BUNDLES_DAYS" ]]; then
+        find "$BACKUP_DIR" -type f -name '*.bundle' -mtime +"$KEEP_BUNDLES_DAYS" -delete
+    fi
+
+    if [[ -n "$KEEP_BUNDLES" ]]; then
+        find "$BACKUP_DIR" -type f -name '*.bundle' -printf '%T@ %p\n' |
+            sort -rn |
+            awk -v keep="$KEEP_BUNDLES" 'NR > keep { sub(/^[^ ]+ /, ""); print }' |
+            while IFS= read -r old_bundle; do
+                rm -f "$old_bundle"
+            done
+    fi
+}
+
+resolve_upstream() {
+    local branch="$1"
+    local upstream remote merge
+
+    upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)"
+    if [[ -n "$upstream" ]]; then
+        printf '%s\n' "$upstream"
+        return 0
+    fi
+
+    remote="$(git config "branch.${branch}.remote" 2>/dev/null || true)"
+    merge="$(git config "branch.${branch}.merge" 2>/dev/null || true)"
+    if [[ -n "$remote" && "$remote" != "." && "$merge" == refs/heads/* ]]; then
+        printf '%s/%s\n' "$remote" "${merge#refs/heads/}"
+        return 0
+    fi
+
+    if [[ -n "$remote" && "$remote" != "." ]]; then
+        printf '%s/%s\n' "$remote" "$branch"
+        return 0
+    fi
+
+    printf 'origin/%s\n' "$branch"
+}
+
+remote_for_upstream() {
+    local branch="$1"
+    local upstream="$2"
+    local remote
+
+    remote="$(git config "branch.${branch}.remote" 2>/dev/null || true)"
+    if [[ -n "$remote" && "$remote" != "." ]]; then
+        printf '%s\n' "$remote"
+        return 0
+    fi
+
+    printf '%s\n' "${upstream%%/*}"
+}
+
+fetch_remote() {
+    local remote="$1"
+
+    if [[ "$remote" == "." ]]; then
+        return 0
+    fi
+
+    log "fetching $remote..."
+    if $DRY_RUN; then
+        run_logged git fetch "$remote" --tags --dry-run
+    else
+        run_logged git fetch "$remote" --tags
+    fi
+}
+
+fetch_all_archive() {
+    local args=(fetch --all --tags)
+
+    if $PRUNE_ARCHIVE; then
+        args+=(--prune)
+    fi
+    if $DRY_RUN; then
+        args+=(--dry-run)
+    fi
+
+    log "fetching all remotes..."
+    run_logged git "${args[@]}"
+}
+
+snapshot_current_remote_for_hierarchic() {
+    local remote="$1"
+    local before
+
+    before="$(make_tmp)"
+    capture_refs "refs/remotes/$remote" "$before"
+    snapshot_refs_file "$before" remotes
+    log "snapshotted refs/remotes/$remote/*"
+}
+
+save_divergent_head() {
+    local branch="$1"
+    local old_head="$2"
+    local save_branch="pre-rewrite/${NOW}/${branch}"
+
+    git branch "$save_branch" "$old_head" 2>/dev/null || git update-ref "refs/heads/$save_branch" "$old_head"
+    warn "  saved old HEAD as branch: $save_branch"
+}
+
+update_branch_from_upstream() {
+    local branch="$1"
+    local upstream="$2"
+    local old_head="$3"
+    local new_head="$4"
+    local ahead_count behind_count
+
+    if [[ "$old_head" == "$new_head" ]]; then
+        log "already up to date ($branch @ ${old_head:0:12})"
+        if $BUNDLE_ALWAYS; then
+            create_bundle "manual"
+        fi
+        return 0
+    fi
+
+    if git merge-base --is-ancestor "$old_head" "$new_head" 2>/dev/null; then
+        behind_count="$(git rev-list --count "$old_head".."$new_head")"
+        log "fast-forward: $behind_count new commit(s)"
+
+        if ! $DRY_RUN; then
+            require_clean_worktree
+            run_logged git merge --ff-only "$upstream"
+        fi
+
+        if $BUNDLE_ALWAYS; then
+            create_bundle "manual"
+        fi
+        return 0
+    fi
+
+    if git merge-base --is-ancestor "$new_head" "$old_head" 2>/dev/null; then
+        ahead_count="$(git rev-list --count "$new_head".."$old_head")"
+        log "local branch is ahead of upstream by $ahead_count commit(s); not moving it"
+        if $BUNDLE_ALWAYS; then
+            create_bundle "manual"
+        fi
+        return 0
+    fi
+
+    warn "DIVERGENCE DETECTED on $branch"
+    warn "  local:   $old_head"
+    warn "  upstream: $new_head ($upstream)"
+    ahead_count="$(git rev-list --count "$new_head".."$old_head" 2>/dev/null || echo '?')"
+    behind_count="$(git rev-list --count "$old_head".."$new_head" 2>/dev/null || echo '?')"
+    warn "  local-only commits: $ahead_count"
+    warn "  upstream-only commits: $behind_count"
+
+    save_divergent_head "$branch" "$old_head"
+
+    if ! $NO_BUNDLE; then
+        create_bundle "divergence"
+    fi
+
+    if $DRY_RUN; then
+        warn "  --dry-run: not updating working tree"
+        return 1
+    fi
+
+    if $ACCEPT_REWRITE; then
+        require_clean_worktree
+        run_logged git reset --hard "$upstream"
+        log "updated to upstream HEAD: ${new_head:0:12}"
+        return 0
+    fi
+
+    warn "  not updating working tree; pass --accept-rewrite to move this branch to upstream"
+    return 1
+}
+
+safe_pull_mode() {
+    local branch upstream remote old_head new_head
+
+    branch="$(current_branch)"
+    [[ -n "$branch" ]] || die "detached HEAD, nothing to safepull"
+    old_head="$(require_head)" || die "HEAD does not exist"
+
+    snapshot_head "$branch" "$old_head"
+
+    upstream="$(resolve_upstream "$branch")"
+    remote="$(remote_for_upstream "$branch" "$upstream")"
+
+    if $HIERARCHIC; then
+        snapshot_current_remote_for_hierarchic "$remote"
+    fi
+
+    fetch_remote "$remote"
+
+    if ! git rev-parse "$upstream" >/dev/null 2>&1; then
+        die "upstream ref $upstream not found after fetch"
+    fi
+
+    new_head="$(git rev-parse "$upstream")"
+    update_branch_from_upstream "$branch" "$upstream" "$old_head" "$new_head"
+    rotate_bundles
+}
+
+archive_mode() {
+    local before_remotes after_remotes before_tags after_tags
+    local event=false
+    local fetch_status=0
+    local branch old_head="" upstream="" new_head=""
+
+    before_remotes="$(make_tmp)"
+    after_remotes="$(make_tmp)"
+    before_tags="$(make_tmp)"
+    after_tags="$(make_tmp)"
+
+    capture_refs refs/remotes "$before_remotes"
+    capture_refs refs/tags "$before_tags"
+    snapshot_refs_file "$before_remotes" remotes
+    snapshot_refs_file "$before_tags" tags
+    log "snapshotted existing remote refs and tags"
+
+    if branch="$(current_branch)"; [[ -n "$branch" ]] && old_head="$(require_head)"; then
+        snapshot_head "$branch" "$old_head"
+    fi
+
+    set +e
+    fetch_all_archive
+    fetch_status=$?
+    set -e
+
+    if [[ "$fetch_status" -ne 0 ]]; then
+        warn "fetch failed in archive mode; preserving pre-fetch refs"
+        event=true
+    fi
+
+    if ! $DRY_RUN; then
+        capture_refs refs/remotes "$after_remotes"
+        capture_refs refs/tags "$after_tags"
+        detect_remote_events "$before_remotes" "$after_remotes" event
+        detect_tag_events "$before_tags" "$after_tags" event
+        snapshot_refs_file "$after_remotes" remotes
+        snapshot_refs_file "$after_tags" tags
+    fi
+
+    if $BUNDLE_ALWAYS; then
+        create_bundle "manual"
+    elif $event; then
+        create_bundle "archive-event"
+    elif bundle_due_by_interval; then
+        create_bundle "routine"
+        mark_routine_bundle
+    else
+        log "no destructive upstream event; bundle not created"
+    fi
+
+    rotate_bundles
+
+    if $UPDATE_WORKTREE; then
+        [[ -n "$branch" ]] || die "--update-worktree requires a non-detached HEAD"
+        [[ -n "$old_head" ]] || die "--update-worktree requires an existing HEAD"
+        upstream="$(resolve_upstream "$branch")"
+        if git rev-parse "$upstream" >/dev/null 2>&1; then
+            new_head="$(git rev-parse "$upstream")"
+            update_branch_from_upstream "$branch" "$upstream" "$old_head" "$new_head"
+        else
+            die "upstream ref $upstream not found after archive fetch"
+        fi
+    fi
+
+    if [[ "$fetch_status" -ne 0 ]]; then
+        return "$fetch_status"
+    fi
+}
+
+if $ARCHIVE; then
+    archive_mode
+else
+    safe_pull_mode
+fi
