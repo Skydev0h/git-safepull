@@ -224,6 +224,8 @@ find .git/safepull-bundles -type f -name '*.bundle' -mtime +90 -delete
 ## Notes
 
 - Archive mode protects branch history best. Tag tracking is based on local tag refs after fetch, so remote-specific tag provenance is not modeled separately.
+- Archive mode respects the repository's configured remote fetch refspecs. A shallow single-branch clone will keep monitoring only that configured branch unless you broaden the refspec, for example with `git remote set-branches origin '*'` followed by `git fetch origin --depth=1`.
+- Shallow clones stay shallow. Bundles created from them preserve the objects that are present locally, but they do not reconstruct history from before the shallow boundary.
 - `--dry-run` asks Git to fetch in dry-run mode and skips post-fetch snapshot changes.
 - `--discard-dirty` is intentionally explicit because it permits destructive worktree updates.
 
